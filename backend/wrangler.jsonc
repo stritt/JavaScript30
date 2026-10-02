@@ -1,0 +1,58 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "stepquest-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  "vars": {
+    "APPLE_BUNDLE_ID": "app.stepquest.ios",
+    "INVITE_BASE_URL": "https://stepquest.app/i/",
+    // Enables POST /v1/auth/dev and the X-Debug-Region header. Never "true" in production.
+    "DEV_AUTH": "false"
+  },
+  // Secrets (wrangler secret put): JWT_SECRET
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "stepquest",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "kv_namespaces": [
+    { "binding": "BOARD_CACHE", "id": "00000000000000000000000000000000" }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "BOARD", "class_name": "BoardDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BoardDO"] }],
+
+  "queues": {
+    "producers": [{ "binding": "STEP_QUEUE", "queue": "stepquest-steps" }],
+    "consumers": [
+      {
+        "queue": "stepquest-steps",
+        "max_batch_size": 50,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "stepquest-steps-dlq"
+      }
+    ]
+  },
+
+  "triggers": {
+    // Monday 00:05 UTC: archive last week's boards.
+    "crons": ["5 0 * * 1"]
+  },
+
+  "ratelimits": [
+    { "name": "RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 120, "period": 60 } }
+  ],
+
+  "analytics_engine_datasets": [{ "binding": "ANALYTICS", "dataset": "stepquest_events" }]
+}

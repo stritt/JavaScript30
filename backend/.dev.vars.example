@@ -1,0 +1,2 @@
+DEV_AUTH=true
+JWT_SECRET=local-dev-secret-change-me
