@@ -96,9 +96,12 @@ The niche is real and crowded. You can't win by being "steps → XP" alone.
 ### Boards
 | Scope | Source | Metrics |
 |---|---|---|
-| **Friends** | Game Center friends + invite links | Weekly steps, hero level, deepest zone |
-| **Local** | Opt-in, coarse location (city or ~5 km geohash, never exact) | Weekly steps, zone |
+| **Friends** | Our own friend graph: invite links/codes, plus optional Game Center friend import | Weekly steps, hero level, deepest zone |
+| **Local** | Opt-in. Region comes from Cloudflare's `request.cf` (city/region) or a ~5 km geohash. Never exact location | Weekly steps, zone |
 | **Global** | Everyone | Weekly steps, level, gate speed-run times |
+
+All boards are served from our Cloudflare backend (see §6), not Game Center. That way friends, local and
+global boards, leagues and parties all share one data model.
 
 - **Weekly Leagues.** Groups of 30 similar players, Bronze → Mythic, promotion and relegation.
   This keeps competition fair. A 4k-steps-a-day player isn't up against marathoners.
@@ -118,10 +121,18 @@ Leaderboards are meaningless if people shake their phones or type in 100k steps.
 - Prefer steps from iPhone or Apple Watch sources and flag third-party sources.
 - Cap plausible rate (e.g., >250 spm sustained gets flagged) and use a daily sanity ceiling.
 - Server validates weekly totals. Outliers go to a "verified-only" board instead of being banned.
+- **Apple App Attest** proves requests come from a genuine app install. A Worker verifies the attestation.
+- Step uploads go through a **Cloudflare Queue** consumer that runs the plausibility checks before
+  anything reaches a leaderboard. Rate limiting uses the **Workers Rate Limiting** binding.
 
 ---
 
-## 6. Tech plan (iOS)
+## 6. Tech plan
+
+The rule is **Cloudflare for everything server-side**. Apple frameworks are used only where they're the
+only way to reach the device: HealthKit, CoreMotion, push notifications and App Attest.
+
+### 6a. iOS client
 
 | Concern | Choice |
 |---|---|
@@ -129,24 +140,94 @@ Leaderboards are meaningless if people shake their phones or type in 100k steps.
 | Game scene | **SpriteKit** inside SwiftUI (`SpriteView`) for the trail and battles |
 | Steps (history) | **HealthKit** `HKStatisticsCollectionQuery` with `HKObserverQuery` and background delivery |
 | Steps (live) | **CoreMotion** `CMPedometer` for real-time cadence in Stride Mode |
-| Persistence | **SwiftData** on device |
-| Friends + Global boards | **Game Center** (`GKLeaderboard`, friends API) at no backend cost |
-| Local boards, leagues, parties, World Boss | Small backend: **Supabase** (Postgres + Auth via Sign in with Apple + Edge Functions) |
-| Widgets | WidgetKit: today's steps, hero, gate progress |
-| Live play | ActivityKit Live Activity during Stride Mode |
-| Later | Apple Watch companion (Stride Mode from the wrist) |
+| Local persistence | **SwiftData**. The game simulates offline, and the server is the source of truth for anything competitive |
+| Auth | **Sign in with Apple**. The identity token is exchanged with our Worker for a session JWT |
+| Widgets / live play | WidgetKit, plus an ActivityKit Live Activity during Stride Mode |
+| Assets | Sprite atlases and zone packs downloaded from **R2** behind the CDN, so new zones ship without an App Store release |
+| Later | Apple Watch companion |
 
-### Project layout (planned)
+### 6b. Cloudflare backend
+
 ```
-Stepforge/
+ iOS app ──HTTPS / WebSocket──►  Worker: api (Hono router)
+                                   │
+   ┌──────────────┬────────────────┼──────────────────┬─────────────────┬───────────────┐
+   ▼              ▼                ▼                  ▼                 ▼               ▼
+  D1            KV            Durable Objects       Queues             R2         Analytics Engine
+ players,     hot board      LeagueDO (30 ppl,    step-ingest ──►    sprites,      step / session
+ friends,     snapshots,     live ranks)          anti-cheat         zone packs,   telemetry,
+ step_days,   config,        PartyDO (party +     consumer           avatars       balancing
+ inventory,   feature flags  World Boss HP,       push-fanout ──►
+ leagues                     WebSocket fan-out)   APNs sender
+                             BoardDO (per region/
+                             global sorted set)
+                                   ▲
+                       Cron Triggers: weekly reset, league
+                       promotion/relegation, World Boss spawn
+```
+
+| Need | Cloudflare primitive | Notes |
+|---|---|---|
+| API | **Workers** (TypeScript + Hono) | One `api` Worker. Stateless |
+| Relational data | **D1** | Players, friendships, daily step totals, inventory, league membership |
+| Live leaderboards | **Durable Objects** | One `BoardDO` per scope (`global`, `region:<code>`, `friends:<player>` computed on read). Keeps an in-memory sorted top-N and persists to DO SQLite storage. Strongly consistent rank reads |
+| Leagues | **Durable Objects** (`LeagueDO`) | One per 30-player bracket. Ranks, promotion and relegation state |
+| Parties + World Boss | **Durable Objects** (`PartyDO`) with **WebSocket Hibernation** | Real-time boss HP. Friends see each other's hits live. Costs almost nothing when idle |
+| Board read caching | **KV** | Top-100 snapshots per board, refreshed every minute, for cheap reads at scale |
+| Step ingestion + anti-cheat | **Queues** | `POST /steps` enqueues. The consumer validates and then writes D1 and BoardDOs |
+| Scheduled jobs | **Cron Triggers** | Monday weekly reset, league reshuffle, World Boss spawn, streak checks |
+| Long multi-step jobs | **Workflows** | Weekly season rollover: snapshot, award rewards, reshuffle, notify |
+| Push notifications | Worker → APNs (HTTP/2 + JWT signed with **Secrets Store** key) via a `push` Queue | "Gate breached!", "Friend passed you", World Boss alerts |
+| Assets / CDN | **R2** + custom domain cache | Sprite sheets, zone packs, avatars |
+| Secrets | **Secrets Store** / Worker secrets | APNs key, Apple client secret, JWT signing key |
+| Abuse protection | **Rate Limiting binding**, WAF rules, App Attest check in Worker | |
+| Region for local boards | `request.cf.city` / `region` / `country` | No GPS permission needed. Optional finer geohash if the user opts in |
+| Analytics / balancing | **Workers Analytics Engine** | Steps per session, gate clear times, Stride Mode usage |
+| Logs / tracing | **Workers Logs** + Tail Workers | |
+| Optional AI flavor | **Workers AI** | Generated quest text, boss taunts and weekly recap blurbs. Later |
+
+**What stays off Cloudflare (no alternative exists):** HealthKit and CoreMotion run on the device, APNs is
+Apple's delivery network (Cloudflare sends to it), and App Attest/Sign in with Apple are Apple identity
+(Cloudflare verifies them).
+
+**Game Center:** optional. It's used only for importing the friends list and for achievements. No
+leaderboard data lives there.
+
+### 6c. Key API surface (v1)
+```
+POST /auth/apple            Sign in with Apple token → session JWT (+ App Attest)
+POST /steps                 Batch of { day, steps, flights, source } → Queue
+GET  /boards/:scope         scope = friends | local | global | league  (?metric=steps|level|zone)
+POST /friends/invite        → invite code / universal link
+POST /friends/accept
+GET  /party/:id/ws          WebSocket → PartyDO (World Boss live)
+POST /party/:id/hit         Stride Mode hits during a World Boss
+GET  /config                Zone tables, drop rates, feature flags (KV)
+```
+
+### Repo layout (planned monorepo)
+```
+ios/Stepforge/
   App/            StepforgeApp.swift, RootView
   Health/         HealthKitService, PedometerService
   Game/           GameState, Hero, Zone, Monster, Loot, OfflineSimulator, Formulas
   Scenes/         TrailScene (SpriteKit), BattleScene
   Features/       Home, StrideMode, Inventory, Leaderboards, Party, Settings
-  Social/         GameCenterService, BackendClient
+  Networking/     APIClient, AuthService, PartySocket
   Widgets/        StepforgeWidget
+backend/
+  wrangler.jsonc  Bindings: D1, KV, R2, Queues, DOs, cron, rate limit, AE
+  src/index.ts    Hono router
+  src/do/         BoardDO.ts, LeagueDO.ts, PartyDO.ts
+  src/queues/     stepIngest.ts, pushFanout.ts
+  src/cron/       weeklyReset.ts
+  migrations/     D1 SQL
+shared/
+  formulas.json   Game balance tables shared by client + server
 ```
+
+One benefit of having the backend on Workers: it *can* be built and tested here (`wrangler dev`,
+Vitest with `@cloudflare/vitest-pool-workers`). The iOS side still needs Xcode on a Mac.
 
 ---
 
@@ -157,9 +238,11 @@ Stepforge/
 3. Step Gate at the end of each zone
 4. Stride Mode with live cadence tiers and haptics
 5. Basic gear drops and an inventory screen
-6. Game Center: Friends and Global weekly-steps boards
+6. Cloudflare backend v1: Worker API, Sign in with Apple auth, D1 schema, step ingest Queue,
+   `BoardDO` for Friends / Local / Global weekly-steps boards, weekly reset cron
 
-**Milestone 2:** Local boards, leagues and parties (backend), World Boss, Live Activity, widgets.
+**Milestone 2:** Leagues (`LeagueDO`), parties and live World Boss (`PartyDO` + WebSockets), APNs push,
+R2 zone packs, App Attest, Live Activity, widgets.
 **Milestone 3:** Tower (flights), pets, classes, Watch app.
 
 ---
